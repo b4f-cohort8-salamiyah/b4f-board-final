@@ -1,0 +1,294 @@
+// B4F Board — Prisma schema (PostgreSQL, final stage).
+// Source of truth: ../../projects/b4f-board/specification/DOMAIN-MODEL.md and
+// DATABASE-PROGRESSION.md. Do not diverge from those without updating them first.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum IssueStatus {
+  TODO
+  IN_PROGRESS
+  REVIEW
+  DONE
+}
+
+enum IssuePriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+// Minimal agile-planning layer (Phase C, approved reversal of the earlier
+// sprints/backlog/story-points exclusion - see
+// specification/PRODUCT-SCOPE.md and context/DECISION-LOG.md). Deliberately
+// NOT modeling epics, subtasks, velocity/burndown, or custom workflows.
+enum SprintStatus {
+  PLANNED
+  ACTIVE
+  COMPLETED
+}
+
+enum ActivityAction {
+  ISSUE_CREATED
+  ISSUE_UPDATED
+  STATUS_CHANGED
+  ASSIGNED
+  COMMENTED
+  MEMBER_ADDED
+  MEMBER_REMOVED
+  MEMBER_ROLE_CHANGED
+  // Phase E (mentions): recorded once per @mention found in a comment or an
+  // issue description, create or edit - see common/mentions.util.ts.
+  MENTIONED
+}
+
+// Notification center (Phase G - see specification/NOTIFICATIONS.md and
+// context/DECISION-LOG.md's notification-center entry). Deliberately a
+// SEPARATE model from ActivityLog: ActivityLog is an append-only workspace/
+// project historical audit feed (everyone with access can read all of it);
+// Notification is a per-user personal inbox (only its own userId may ever
+// read or mutate a given row). Kept narrow on purpose - see NotificationsService
+// for the generation rules (never notify a user about their own action,
+// dedupe multiple reasons into one row where the spec calls for it).
+enum NotificationType {
+  MENTION
+  ISSUE_ASSIGNED
+  WORKSPACE_ROLE_CHANGED
+  MEMBER_ADDED
+  COMMENT_ON_REPORTED_OR_ASSIGNED_ISSUE
+  SPRINT_STARTED
+  SPRINT_COMPLETED
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+
+  memberships         WorkspaceMember[]
+  // Restrict, not Cascade: deleting a user must never silently delete a whole
+  // workspace and everything in it. Ownership must be transferred or the
+  // workspace deleted explicitly first. See DATABASE-PROGRESSION.md.
+  ownedWorkspaces     Workspace[]       @relation("WorkspaceOwner")
+  reportedIssues      Issue[]           @relation("IssueReporter")
+  assignedIssues      Issue[]           @relation("IssueAssignee")
+  comments            Comment[]
+  activityEntries     ActivityLog[]
+  // Cascade: a deleted user's own inbox has no remaining reader, so it goes
+  // with them - never blocks deleting the user. See Notification below.
+  notifications       Notification[]    @relation("NotificationRecipient")
+  // SetNull on the Notification side (not modeled as a list requiring
+  // cascade here) - a deleted actor must never block deleting that user,
+  // and the notifications they caused stay in their recipients' inboxes.
+  causedNotifications Notification[]    @relation("NotificationActor")
+
+  @@map("users")
+}
+
+model Workspace {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  ownerId   String   @db.Uuid
+  owner     User     @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+
+  members       WorkspaceMember[]
+  projects      Project[]
+  activity      ActivityLog[]
+  notifications Notification[]
+
+  @@map("workspaces")
+}
+
+model WorkspaceMember {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @db.Uuid
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId      String        @db.Uuid
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role        WorkspaceRole
+  joinedAt    DateTime      @default(now())
+
+  // One role per member per workspace, never two rows — see DOMAIN-MODEL.md.
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@map("workspace_members")
+}
+
+model Project {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @db.Uuid
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  key         String
+  description String?
+  // Atomically incremented inside a transaction on issue creation to produce
+  // the human-readable issue key (e.g. WEB-42) — see IssuesService.create()
+  // and DATABASE-PROGRESSION.md, "Transactions".
+  issueSeq    Int       @default(0)
+  createdAt   DateTime  @default(now())
+
+  issues        Issue[]
+  sprints       Sprint[]
+  notifications Notification[]
+
+  @@unique([workspaceId, key])
+  @@map("projects")
+}
+
+model Sprint {
+  id        String       @id @default(uuid()) @db.Uuid
+  projectId String       @db.Uuid
+  project   Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name      String
+  goal      String?
+  status    SprintStatus @default(PLANNED)
+  startDate DateTime?
+  endDate   DateTime?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  // onDelete: SetNull on Issue.sprint, not Cascade - deleting a sprint must
+  // return its issues to the backlog, never delete them. See
+  // SprintsService for the "one ACTIVE sprint per project" and "a COMPLETED
+  // sprint cannot become ACTIVE again" rules, enforced in the service layer
+  // (same style as the existing ownership/role checks elsewhere in this
+  // codebase, not a DB constraint).
+  issues        Issue[]
+  notifications Notification[]
+
+  @@index([projectId, status])
+  @@map("sprints")
+}
+
+model Issue {
+  id          String        @id @default(uuid()) @db.Uuid
+  projectId   String        @db.Uuid
+  project     Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  key         String
+  title       String
+  description String?
+  status      IssueStatus   @default(TODO)
+  priority    IssuePriority @default(MEDIUM)
+  assigneeId  String?       @db.Uuid
+  assignee    User?         @relation("IssueAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  reporterId  String?       @db.Uuid
+  reporter    User?         @relation("IssueReporter", fields: [reporterId], references: [id], onDelete: SetNull)
+  // Nullable: an issue with no points simply isn't estimated yet - zero is a
+  // real, distinct value (a trivial/no-effort issue), so this is never
+  // defaulted to 0. Validated non-negative at the DTO layer, not here - see
+  // UpdateIssueDto/CreateIssueDto.
+  storyPoints Int?
+  // Nullable: zero or one sprint, by construction (a single optional FK, not
+  // a join table) - no issue belongs to more than one sprint at a time. Null
+  // means "in the backlog". See SprintsService for the rule that a sprint
+  // assigned here must belong to this issue's own project.
+  sprintId    String?       @db.Uuid
+  sprint      Sprint?       @relation(fields: [sprintId], references: [id], onDelete: SetNull)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  comments      Comment[]
+  activity      ActivityLog[]
+  notifications Notification[]
+
+  @@unique([projectId, key])
+  @@index([projectId, status])
+  @@index([sprintId])
+  @@map("issues")
+}
+
+model Comment {
+  id        String   @id @default(uuid()) @db.Uuid
+  issueId   String   @db.Uuid
+  issue     Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  // Nullable + SetNull on purpose: deleting a user must not delete the
+  // comment history, only anonymize the authorship. See DATABASE-PROGRESSION.md.
+  authorId  String?  @db.Uuid
+  author    User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  body      String
+  createdAt DateTime @default(now())
+
+  notifications Notification[]
+
+  @@index([issueId, createdAt])
+  @@map("comments")
+}
+
+model ActivityLog {
+  id          String         @id @default(uuid()) @db.Uuid
+  // Nullable: some entries are workspace-level (e.g. member added), not tied
+  // to one issue — see DOMAIN-MODEL.md.
+  issueId     String?        @db.Uuid
+  issue       Issue?         @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  workspaceId String         @db.Uuid
+  workspace   Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  actorId     String?        @db.Uuid
+  actor       User?          @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action      ActivityAction
+  metadata    Json?
+  createdAt   DateTime       @default(now())
+
+  @@index([issueId, createdAt])
+  @@index([workspaceId, createdAt])
+  @@map("activity_logs")
+}
+
+// Per-user persistent inbox - see the big comment on NotificationType above
+// for why this is a separate model from ActivityLog. Every FK below besides
+// userId is nullable with onDelete: SetNull: a notification must never block
+// deleting the workspace/project/issue/comment/sprint it refers to, and must
+// keep displaying (with a safe fallback) after that happens rather than
+// disappearing or crashing - see NotificationsService.toDto() on the API
+// side and the frontend's notification rendering for that fallback.
+// `title`/`message` are plain point-in-time text (same reasoning as
+// ActivityLog.metadata and the mention util's embedded display name) so a
+// notification still reads sensibly even once a referenced row is gone.
+model Notification {
+  id      String           @id @default(uuid()) @db.Uuid
+  type    NotificationType
+  title   String
+  message String
+
+  userId String @db.Uuid
+  user   User   @relation("NotificationRecipient", fields: [userId], references: [id], onDelete: Cascade)
+
+  actorUserId String? @db.Uuid
+  actorUser   User?   @relation("NotificationActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  workspaceId String?    @db.Uuid
+  workspace   Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  projectId   String?    @db.Uuid
+  project     Project?   @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  issueId     String?    @db.Uuid
+  issue       Issue?     @relation(fields: [issueId], references: [id], onDelete: SetNull)
+  commentId   String?    @db.Uuid
+  comment     Comment?   @relation(fields: [commentId], references: [id], onDelete: SetNull)
+  sprintId    String?    @db.Uuid
+  sprint      Sprint?    @relation(fields: [sprintId], references: [id], onDelete: SetNull)
+
+  metadata  Json?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}

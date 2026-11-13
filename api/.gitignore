@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+*.log
+.pgdata/
+.pgdata.log
+.pgdata-init.log
+.DS_Store
+coverage/
